@@ -25,11 +25,27 @@ static uint8_t clamp_rgb_channel_(int value) {
   return value;
 }
 
-static void apply_rgb565_brightness_(camera_fb_t *buffer, int brightness) {
-  if (brightness == 0 || buffer == nullptr || buffer->format != PIXFORMAT_RGB565) {
+static int exposure_scale_for_level_(int level) {
+  switch (level) {
+    case -2:
+      return 128;
+    case -1:
+      return 180;
+    case 1:
+      return 360;
+    case 2:
+      return 512;
+    default:
+      return 256;
+  }
+}
+
+static void apply_rgb565_adjustments_(camera_fb_t *buffer, int brightness, int ae_level) {
+  if ((brightness == 0 && ae_level == 0) || buffer == nullptr || buffer->format != PIXFORMAT_RGB565) {
     return;
   }
 
+  const int exposure_scale = exposure_scale_for_level_(ae_level);
   const int offset = brightness * 32;
   const size_t pixel_count = buffer->len / 2;
   auto *data = buffer->buf;
@@ -39,9 +55,9 @@ static void apply_rgb565_brightness_(camera_fb_t *buffer, int brightness) {
     uint8_t green = ((data[index] & 0x07) << 5) | ((data[index + 1] & 0xE0) >> 3);
     uint8_t blue = (data[index + 1] & 0x1F) << 3;
 
-    red = clamp_rgb_channel_(red + offset);
-    green = clamp_rgb_channel_(green + offset);
-    blue = clamp_rgb_channel_(blue + offset);
+    red = clamp_rgb_channel_(((red * exposure_scale) >> 8) + offset);
+    green = clamp_rgb_channel_(((green * exposure_scale) >> 8) + offset);
+    blue = clamp_rgb_channel_(((blue * exposure_scale) >> 8) + offset);
 
     data[index] = (red & 0xF8) | ((green >> 5) & 0x07);
     data[index + 1] = (green & 0xE0) | (blue >> 3);
@@ -239,7 +255,8 @@ void ESP32Camera::loop() {
     return;
   }
   this->current_image_ =
-      std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_, this->brightness_);
+      std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_, this->brightness_,
+                                         this->ae_level_);
 
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
   ESP_LOGV(TAG, "Got Image: len=%u", fb->len);
@@ -479,8 +496,8 @@ void ESP32CameraImageReader::consume_data(size_t consumed) { this->offset_ += co
 uint8_t *ESP32CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
 
 /* ---------------- ESP32CameraImage class ----------- */
-ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, int brightness)
-    : buffer_(buffer), requesters_(requesters), brightness_(brightness) {
+ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, int brightness, int ae_level)
+    : buffer_(buffer), requesters_(requesters), brightness_(brightness), ae_level_(ae_level) {
   if (this->buffer_ == nullptr) {
     return;
   }
@@ -491,7 +508,7 @@ ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, int 
     return;
   }
 
-  apply_rgb565_brightness_(this->buffer_, this->brightness_);
+  apply_rgb565_adjustments_(this->buffer_, this->brightness_, this->ae_level_);
   if (frame2jpg(this->buffer_, 80, &this->jpeg_buffer_, &this->jpeg_length_)) {
     this->owns_jpeg_buffer_ = true;
   } else {
