@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <img_converters.h>
 #include <cstdlib>
+#include <algorithm>
 
 namespace esphome {
 namespace esp32_camera {
@@ -17,51 +18,34 @@ static const char *const TAG = "esp32_camera";
 static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
 #endif
 
-static uint8_t clamp_rgb_channel_(int value) {
-  if (value < 0)
-    return 0;
-  if (value > 255)
-    return 255;
-  return value;
+static constexpr uint16_t GC2145_PID_VALUE = 0x2145;
+
+static int gc2145_set_reg_(sensor_t *sensor, uint8_t page, uint8_t reg, uint8_t mask, uint8_t value) {
+  int ret = sensor->set_reg(sensor, 0xfe, 0xff, page);
+  if (ret != 0) {
+    return ret;
+  }
+  return sensor->set_reg(sensor, reg, mask, value);
 }
 
-static int exposure_scale_for_level_(int level) {
-  switch (level) {
-    case -2:
-      return 128;
-    case -1:
-      return 180;
-    case 1:
-      return 360;
-    case 2:
-      return 512;
-    default:
-      return 256;
-  }
-}
+static void gc2145_update_camera_parameters_(sensor_t *sensor, bool aec_enabled, uint32_t exposure,
+                                             bool agc_enabled, uint8_t gain, int ae_level) {
+  // The upstream GC2145 driver exposes these settings as dummy methods. Write the sensor registers directly.
+  const uint16_t exposure_lines = std::clamp<uint32_t>(exposure, 1, 1200);
+  const uint8_t target_y = std::clamp(0x40 + ae_level * 0x10, 0x10, 0xf0);
 
-static void apply_rgb565_adjustments_(camera_fb_t *buffer, int brightness, int ae_level) {
-  if ((brightness == 0 && ae_level == 0) || buffer == nullptr || buffer->format != PIXFORMAT_RGB565) {
-    return;
-  }
+  gc2145_set_reg_(sensor, 0x00, 0xb6, 0x01, aec_enabled ? 0x01 : 0x00);
+  gc2145_set_reg_(sensor, 0x00, 0x03, 0xff, exposure_lines >> 8);
+  gc2145_set_reg_(sensor, 0x00, 0x04, 0xff, exposure_lines & 0xff);
+  gc2145_set_reg_(sensor, 0x00, 0xb0, 0xff, agc_enabled ? 0x55 : gain);
+  gc2145_set_reg_(sensor, 0x01, 0x13, 0xff, target_y);
+  gc2145_set_reg_(sensor, 0x00, 0xfe, 0xff, 0x00);
 
-  const int exposure_scale = exposure_scale_for_level_(ae_level);
-  const int offset = brightness * 32;
-  const size_t pixel_count = buffer->len / 2;
-  auto *data = buffer->buf;
-  for (size_t i = 0; i < pixel_count; i++) {
-    const size_t index = i * 2;
-    uint8_t red = data[index] & 0xF8;
-    uint8_t green = ((data[index] & 0x07) << 5) | ((data[index + 1] & 0xE0) >> 3);
-    uint8_t blue = (data[index + 1] & 0x1F) << 3;
-
-    red = clamp_rgb_channel_(((red * exposure_scale) >> 8) + offset);
-    green = clamp_rgb_channel_(((green * exposure_scale) >> 8) + offset);
-    blue = clamp_rgb_channel_(((blue * exposure_scale) >> 8) + offset);
-
-    data[index] = (red & 0xF8) | ((green >> 5) & 0x07);
-    data[index + 1] = (green & 0xE0) | (blue >> 3);
-  }
+  sensor->status.aec = aec_enabled;
+  sensor->status.agc = agc_enabled;
+  sensor->status.aec_value = exposure_lines;
+  sensor->status.agc_gain = gain;
+  sensor->status.ae_level = ae_level;
 }
 
 /* ---------------- public API (derivated) ---------------- */
@@ -255,8 +239,7 @@ void ESP32Camera::loop() {
     return;
   }
   this->current_image_ =
-      std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_, this->brightness_,
-                                         this->ae_level_);
+      std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_);
 
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
   ESP_LOGV(TAG, "Got Image: len=%u", fb->len);
@@ -444,6 +427,9 @@ void ESP32Camera::request_image(camera::CameraRequester requester) { this->singl
 camera::CameraImageReader *ESP32Camera::create_image_reader() { return new ESP32CameraImageReader; }
 void ESP32Camera::update_camera_parameters() {
   sensor_t *s = esp_camera_sensor_get();
+  if (s == nullptr) {
+    return;
+  }
   /* update image */
   s->set_vflip(s, this->vertical_flip_);
   s->set_hmirror(s, this->horizontal_mirror_);
@@ -464,6 +450,11 @@ void ESP32Camera::update_camera_parameters() {
   s->set_wb_mode(s, (int) this->wb_mode_);  // 0 to 4
   /* update test pattern */
   s->set_colorbar(s, this->test_pattern_);
+
+  if (s->id.PID == GC2145_PID_VALUE) {
+    gc2145_update_camera_parameters_(s, (bool) this->aec_mode_, this->aec_value_, (bool) this->agc_mode_,
+                                     this->agc_value_, this->ae_level_);
+  }
 }
 
 /* ---------------- Internal methods ---------------- */
@@ -496,8 +487,7 @@ void ESP32CameraImageReader::consume_data(size_t consumed) { this->offset_ += co
 uint8_t *ESP32CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
 
 /* ---------------- ESP32CameraImage class ----------- */
-ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, int brightness, int ae_level)
-    : buffer_(buffer), requesters_(requesters), brightness_(brightness), ae_level_(ae_level) {
+ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters) : buffer_(buffer), requesters_(requesters) {
   if (this->buffer_ == nullptr) {
     return;
   }
@@ -508,7 +498,6 @@ ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, int 
     return;
   }
 
-  apply_rgb565_adjustments_(this->buffer_, this->brightness_, this->ae_level_);
   if (frame2jpg(this->buffer_, 80, &this->jpeg_buffer_, &this->jpeg_length_)) {
     this->owns_jpeg_buffer_ = true;
   } else {
