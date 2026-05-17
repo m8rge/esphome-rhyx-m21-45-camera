@@ -76,7 +76,7 @@ enum ESP32SpecialEffect {
 /* ---------------- CameraImage class ---------------- */
 class ESP32CameraImage : public camera::CameraImage {
  public:
-  ESP32CameraImage(camera_fb_t *buffer, uint8_t requester);
+  ESP32CameraImage(camera_fb_t *buffer, uint8_t requester, bool software_vertical_flip);
   ~ESP32CameraImage() override;
   camera_fb_t *get_raw_buffer();
   uint8_t *get_data_buffer() override;
@@ -86,6 +86,7 @@ class ESP32CameraImage : public camera::CameraImage {
  protected:
   camera_fb_t *buffer_;
   uint8_t requesters_;
+  bool software_vertical_flip_{false};
   uint8_t *jpeg_buffer_{nullptr};
   size_t jpeg_length_{0};
   bool owns_jpeg_buffer_{false};

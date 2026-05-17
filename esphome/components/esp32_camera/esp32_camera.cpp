@@ -9,6 +9,8 @@
 #include <img_converters.h>
 #include <cstdlib>
 #include <algorithm>
+#include <cstring>
+#include <memory>
 
 namespace esphome {
 namespace esp32_camera {
@@ -19,6 +21,26 @@ static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
 #endif
 
 static constexpr uint16_t GC2145_PID_VALUE = 0x2145;
+
+static bool is_gc2145_(sensor_t *sensor) { return sensor != nullptr && sensor->id.PID == GC2145_PID_VALUE; }
+
+static void flip_rgb565_vertical_(camera_fb_t *buffer) {
+  if (buffer == nullptr || buffer->format != PIXFORMAT_RGB565 || buffer->width == 0 || buffer->height == 0) {
+    return;
+  }
+  const size_t row_size = buffer->width * 2;
+  if (buffer->len < row_size * buffer->height) {
+    return;
+  }
+  std::unique_ptr<uint8_t[]> row_buffer(new uint8_t[row_size]);
+  for (size_t top = 0, bottom = buffer->height - 1; top < bottom; top++, bottom--) {
+    uint8_t *top_row = buffer->buf + top * row_size;
+    uint8_t *bottom_row = buffer->buf + bottom * row_size;
+    std::memcpy(row_buffer.get(), top_row, row_size);
+    std::memcpy(top_row, bottom_row, row_size);
+    std::memcpy(bottom_row, row_buffer.get(), row_size);
+  }
+}
 
 static int gc2145_set_reg_(sensor_t *sensor, uint8_t page, uint8_t reg, uint8_t mask, uint8_t value) {
   int ret = sensor->set_reg(sensor, 0xfe, 0xff, page);
@@ -238,8 +260,10 @@ void ESP32Camera::loop() {
     xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
     return;
   }
-  this->current_image_ =
-      std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_);
+  sensor_t *sensor = esp_camera_sensor_get();
+  const bool software_vertical_flip = is_gc2145_(sensor) && this->vertical_flip_;
+  this->current_image_ = std::make_shared<ESP32CameraImage>(
+      fb, this->single_requesters_ | this->stream_requesters_, software_vertical_flip);
 
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
   ESP_LOGV(TAG, "Got Image: len=%u", fb->len);
@@ -451,7 +475,7 @@ void ESP32Camera::update_camera_parameters() {
   /* update test pattern */
   s->set_colorbar(s, this->test_pattern_);
 
-  if (s->id.PID == GC2145_PID_VALUE) {
+  if (is_gc2145_(s)) {
     gc2145_update_camera_parameters_(s, (bool) this->aec_mode_, this->aec_value_, (bool) this->agc_mode_,
                                      this->agc_value_, this->ae_level_);
   }
@@ -487,7 +511,8 @@ void ESP32CameraImageReader::consume_data(size_t consumed) { this->offset_ += co
 uint8_t *ESP32CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
 
 /* ---------------- ESP32CameraImage class ----------- */
-ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters) : buffer_(buffer), requesters_(requesters) {
+ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, bool software_vertical_flip)
+    : buffer_(buffer), requesters_(requesters), software_vertical_flip_(software_vertical_flip) {
   if (this->buffer_ == nullptr) {
     return;
   }
@@ -496,6 +521,10 @@ ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters) : bu
     this->jpeg_buffer_ = this->buffer_->buf;
     this->jpeg_length_ = this->buffer_->len;
     return;
+  }
+
+  if (this->software_vertical_flip_) {
+    flip_rgb565_vertical_(this->buffer_);
   }
 
   if (frame2jpg(this->buffer_, 80, &this->jpeg_buffer_, &this->jpeg_length_)) {
