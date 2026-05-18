@@ -5,6 +5,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include <esp_heap_caps.h>
 #include <freertos/task.h>
 #include <img_converters.h>
 #include <cstdlib>
@@ -22,6 +23,17 @@ static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
 
 static constexpr uint16_t GC2145_PID_VALUE = 0x2145;
 
+static void log_memory_(const char *event) {
+  ESP_LOGW(TAG,
+           "%s: heap free=%u largest=%u min_free=%u, psram free=%u largest=%u",
+           event,
+           heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+           heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+           heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
 static bool is_gc2145_(sensor_t *sensor) { return sensor != nullptr && sensor->id.PID == GC2145_PID_VALUE; }
 
 static void flip_rgb565_vertical_(camera_fb_t *buffer) {
@@ -32,14 +44,19 @@ static void flip_rgb565_vertical_(camera_fb_t *buffer) {
   if (buffer->len < row_size * buffer->height) {
     return;
   }
-  std::unique_ptr<uint8_t[]> row_buffer(new uint8_t[row_size]);
+  auto *row_buffer = static_cast<uint8_t *>(heap_caps_malloc(row_size, MALLOC_CAP_8BIT));
+  if (row_buffer == nullptr) {
+    log_memory_("vertical flip row buffer allocation failed");
+    return;
+  }
   for (size_t top = 0, bottom = buffer->height - 1; top < bottom; top++, bottom--) {
     uint8_t *top_row = buffer->buf + top * row_size;
     uint8_t *bottom_row = buffer->buf + bottom * row_size;
-    std::memcpy(row_buffer.get(), top_row, row_size);
+    std::memcpy(row_buffer, top_row, row_size);
     std::memcpy(top_row, bottom_row, row_size);
-    std::memcpy(bottom_row, row_buffer.get(), row_size);
+    std::memcpy(bottom_row, row_buffer, row_size);
   }
+  free(row_buffer);
 }
 
 static int gc2145_set_reg_(sensor_t *sensor, uint8_t page, uint8_t reg, uint8_t mask, uint8_t value) {
@@ -85,6 +102,7 @@ void ESP32Camera::setup() {
   esp_err_t err = esp_camera_init(&this->config_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
+    log_memory_("esp_camera_init failed");
     this->init_error_ = err;
     this->mark_failed();
     return;
@@ -488,6 +506,9 @@ void ESP32Camera::framebuffer_task(void *pv) {
   ESP32Camera *that = (ESP32Camera *) pv;
   while (true) {
     camera_fb_t *framebuffer = esp_camera_fb_get();
+    if (framebuffer == nullptr) {
+      log_memory_("esp_camera_fb_get returned null");
+    }
     xQueueSend(that->framebuffer_get_queue_, &framebuffer, portMAX_DELAY);
     // return is no-op for config with 1 fb
     xQueueReceive(that->framebuffer_return_queue_, &framebuffer, portMAX_DELAY);
@@ -530,7 +551,9 @@ ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, bool
   if (frame2jpg(this->buffer_, 80, &this->jpeg_buffer_, &this->jpeg_length_)) {
     this->owns_jpeg_buffer_ = true;
   } else {
-    ESP_LOGW(TAG, "frame2jpg conversion failed, falling back to raw frame");
+    ESP_LOGW(TAG, "frame2jpg conversion failed for frame len=%u size=%ux%u format=%u, falling back to raw frame",
+             (uint32_t) this->buffer_->len, this->buffer_->width, this->buffer_->height, this->buffer_->format);
+    log_memory_("frame2jpg conversion failed");
     this->jpeg_buffer_ = this->buffer_->buf;
     this->jpeg_length_ = this->buffer_->len;
   }
